@@ -1,0 +1,37 @@
+---------------------------------------------------------------------------------
+-                                                                               -
+-                   qptsmtpd-plugin-gpg                                         -
+-                                                                               -
+---------------------------------------------------------------------------------
+
+Author      : Dominik Meyer <dmeyer@federationhq.de>
+Initial Date: 2013-08-12
+
+
+Description:
+------------
+
+This plugin for the SMTP MTA qpsmtpd will encrypt every incoming eMail, which
+is not already PGP encrypted, with the recipients pgp public key.
+
+I got the idea for this project, while reading: https://grepular.com/Automatically_Encrypting_all_Incoming_Email
+A lot of code is inspired from the above project.
+
+
+The pgp encryption ensures, that the eMail body is stored encrypted in the backend storage, for
+example an IMAP server. A lot of current eMail clients support pgp/gpg encrypted emails and ask
+for the pgp passphrase, if you select an encrypted email.
+
+
+
+
+Problems/Security Considerations:
+---------------------------------
+
+    - The eMails are encrypted while getting into the mailserver. The eMails can be read in plain
+      from the network line by your backend provider, if the connection is not SSL/TLS encrypted 
+    
+    - The eMail lies unencrypted for some time into the spool directory of qpstmpd. This can not be
+      secured. But to reduce recovery attempts by an attacker you can use an encrypted spool directory 
+      or a RAM Disk. Perhaps an encfs encrypted spool directory only readable by the qpstmpd user, created
+      manually at every boot may help, if you are paranoid.

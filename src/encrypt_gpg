@@ -1,0 +1,117 @@
+
+=head1 NAME
+
+encrypt_gpg - encrypt incoming emails whith the recipients PGP public key
+
+
+=head1 DESCRIPTION
+
+Plugin checks, if there is a trusted public key for each of the recipients 
+of the incoming email, in the GnuPG public key ring of the user running qpsmtpd. 
+If such a key exists the email is encrypted with these keys.
+
+
+=head1 PER USER CONFIG
+
+The file encrypt_gpg_user is a lookup up table for eMails in the form:
+
+email encryption_type 
+
+possible values for encryption_type are none and pgpmime. The standard is
+pgpmime. With none the encryption can be deactivated completely.
+
+=cut
+
+use Qpsmtpd::DSN;
+use Mail::GnuPG;
+use GnuPG::Interface;
+use MIME::Parser;
+
+#init
+sub init {
+ my ( $self, $qp, @args ) = @_;
+ 
+ 
+ # get us the user config file
+ my @encrypted_user_config = $self->qp->config("encrypt_gpg_user");
+ my %user_hash;
+ 
+ for my $e (@encrypted_user_config) {
+  my ( $email, $encryption_type ) = split /\s+/, $e, 2;
+  $user_hash{$email}=$encryption_type;
+ }
+ 
+ $self->{_gpg_user}=\%user_hash;
+ 
+}
+
+# search for the users public key
+# the key id can be given in a file or is search for on a keyserver
+# and create a Mail::GnuPG object
+sub hook_rcpt {
+ my ( $self, $transaction, $recipient, %param ) = @_;
+ my $rcpt = $recipient;
+ $rcpt =~ s/<//;
+ $rcpt =~ s/>//;
+ 
+ #get us the user hash
+ my %user_hash = %{$self->{_gpg_user}};
+ 
+ if (defined($user_hash{$rcpt}) && $user_hash{$rcpt} eq "none" ) {
+  $self->log( LOGINFO, "GPG: encryption deactivated for email " .$rcpt );
+  $self->{_gpg_on}=0;
+  return OK;
+ }
+ $self->{_gpg_on}=1;
+ 
+ my $gpg = new Mail::GnuPG( keydir => '/var/spool/qpsmtpd/.gnupg/', always_trust => 1 );
+
+ if ( !$gpg->has_public_key($rcpt) ) {
+  $self->log( LOGINFO, "GPG: no key for -" . $rcpt . "- found !" );
+  $self->{_gpg_on}=0;
+  return OK;
+ }
+
+ # save gnupg object for rest of the session
+ $self->{_gpg}           = $gpg;
+ $self->{_gpg_recipient} = $rcpt;
+
+ return (OK);
+}
+
+#check if mail is already encrypted, otherwise encrypt it
+sub hook_data_post {
+ my ( $self, $transaction ) = @_;
+ 
+ # if gpg is deactivated, skip this hook
+ if ($self->{_gpg_on}==0) {
+  return OK;
+ }
+ 
+ #parse queued message
+ my $parser = new MIME::Parser();
+ $parser->decode_bodies(1);
+ $parser->output_to_core(1);
+ my $mime = $parser->parse_open( $transaction->body_filename() );
+
+ #check if email is already encrypted
+ if ( $self->{_gpg}->is_encrypted($mime) ) {
+  $self->log( LOGINFO, "GPG: email already PGP encrypted" );
+  return OK;
+ }
+
+ #encrypt message
+ my $code;
+ $code = $self->{_gpg}->mime_encrypt( $mime, $self->{_gpg_recipient} );
+ if ( $code != 0 ) {
+  $self->log( LOGERROR, "GPG: " . $self->{_gpg}->{last_message}->[0] );
+  return OK;
+ }
+ 
+ # rewrite the queued message
+ open my $queued_mail, ">" . $transaction->body_filename();
+ print $queued_mail $mime->stringify;
+ close $queued_mail;
+
+ return OK;
+}
