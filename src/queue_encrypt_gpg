@@ -1,0 +1,129 @@
+use Qpsmtpd::DSN;
+use Mail::GnuPG;
+use MIME::Parser;
+use Net::SMTP;
+
+#init
+sub init {
+    my ( $self, $qp, @args ) = @_;
+
+    if ( @args > 0 ) {
+        if ( $args[0] =~ /^([\.\w_-]+)$/ ) {
+            $self->{_smtp_server} = $1;
+        }
+        else {
+            die "Bad data in smtp server: $args[0]";
+        }
+        $self->{_smtp_port} = 25;
+        if ( @args > 1 and $args[1] =~ /^(\d+)$/ ) {
+            $self->{_smtp_port} = $1;
+        }
+        $self->log( LOGWARN, "WARNING: Ignoring additional arguments." ) if ( @args > 2 );
+    }
+    else {
+        die("No SMTP server specified in smtp-forward config");
+    }
+
+    # get us the user config file
+    my @encrypted_user_config = $self->qp->config("encrypt_gpg_user");
+    my %user_hash;
+
+    for my $e (@encrypted_user_config) {
+        my ( $email, $encryption_type ) = split /\s+/, $e, 2;
+        $user_hash{$email} = $encryption_type;
+    }
+
+    $self->{_gpg_user} = \%user_hash;
+
+}
+
+# this subroutite returns the encrypted email, if a valid and trusted PGP Public Key is found
+# in the GnuPG keyring of the user running QPSMTPD for all the recipients of the eMail
+# if no key is found, the plain unencrypted eMail is returned
+sub encrypt_mail {
+    my ( $self, $transaction ) = @_;
+
+    # set correct HOMEDIR and get us an GPG object
+    $ENV{HOME} = ( getpwuid($>) )[7];
+    my $gpg = new Mail::GnuPG( keydir => '/var/spool/qpsmtpd/.gnupg/', always_trust => 1 );
+
+    # get us all recipients and remove the brackets around them
+    my @recipients_temp = $transaction->recipients();
+    my @recipients;
+
+    for my $r (@recipients_temp) {
+        $r =~ s/<//;
+        $r =~ s/>//;
+        push( @recipients, $r );
+    }
+
+    # check if we have a trusted public key available for every recipient
+    my $keys_available = 1;
+
+    for my $r (@recipients) {
+        if ( !$gpg->has_public_key($r) ) {
+            $self->log( LOGINFO, "GPG: no public key found for " . $r );
+            $keys_available = 0;
+        }
+    }
+
+    #
+    #parse eMail into a Mime::Entity Object
+    #
+
+    #enforce correct rights
+    chmod 0600, $transaction->body_filename;
+
+    my $parser = new MIME::Parser();
+    $parser->decode_bodies(1);
+    $parser->output_to_core(1);
+    my $mime = $parser->parse_open( $transaction->body_filename );
+
+    #if we have all keys available and eMail is not encrypted already
+    if ( $keys_available == 1 && !$gpg->is_encrypted($mime) ) {
+
+        $self->log( LOGINFO, "GPG: encrypting email" );
+
+        #encrypt message
+        my $code = $gpg->mime_encrypt( $mime, @recipients );
+        if ( $code != 0 ) {
+            $self->log( LOGERROR, "GPG: " . $self->{_gpg}->{last_message}->[0] );
+        }
+
+        ## Remove some headers which might have been broken by the process of encryption
+        $mime->head()->delete($_) foreach qw( DKIM-Signature DomainKey-Signature );
+
+    }
+    return $mime;
+}
+
+sub hook_queue {
+    my ( $self, $transaction ) = @_;
+
+    #encrypt email or not
+    my $email = $self->encrypt_mail($transaction);
+
+    $self->log( LOGINFO, "forwarding to $self->{_smtp_server}:$self->{_smtp_port}" );
+
+    my $smtp = Net::SMTP->new(
+                               $self->{_smtp_server},
+                               Port    => $self->{_smtp_port},
+                               Timeout => 60,
+                               Hello   => $self->qp->config("me"),
+    ) || die $!;
+
+    $smtp->mail( $transaction->sender->address || "" )
+      or return ( DECLINED, "Unable to queue message ($!)" );
+
+    for ( $transaction->recipients ) {
+        $smtp->to( $_->address ) or return ( DECLINED, "Unable to queue message ($!)" );
+    }
+
+    $smtp->data() or return ( DECLINED, "Unable to queue message ($!)" );
+
+    $smtp->datasend( $email->stringify );
+    $smtp->dataend() or return ( DECLINED, "Unable to queue message ($!)" );
+    $smtp->quit()    or return ( DECLINED, "Unable to queue message ($!)" );
+    $self->log( LOGINFO, "finished queueing" );
+    return ( OK, "Queued!" );
+}
